@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Alpha Trading Bot - Dashboard</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body { font-family: -apple-system, 'Segoe UI', sans-serif; background: #0a0e17; color: #e1e4e8; min-height: 100vh; }
+.header { background: linear-gradient(135deg, #1a1f36 0%, #0d1117 100%); padding: 16px 24px; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #21262d; }
+.header h1 { font-size: 20px; color: #58a6ff; }
+.status-badge { padding: 4px 12px; border-radius: 12px; font-size: 13px; font-weight: 600; }
+.status-running { background: #0d4429; color: #3fb950; }
+.status-stopped { background: #490b0b; color: #f85149; }
+.container { max-width: 1400px; margin: 0 auto; padding: 20px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; margin-bottom: 16px; }
+.card { background: #161b22; border: 1px solid #21262d; border-radius: 12px; padding: 20px; }
+.card-title { font-size: 13px; color: #8b949e; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 12px; }
+.price-big { font-size: 36px; font-weight: 700; color: #f0f6fc; }
+.price-change { font-size: 16px; margin-left: 8px; }
+.up { color: #3fb950; }
+.down { color: #f85149; }
+.metric { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #21262d; }
+.metric:last-child { border: none; }
+.metric-label { color: #8b949e; }
+.metric-value { color: #e1e4e8; font-weight: 600; }
+.signal-bar { display: flex; height: 32px; border-radius: 6px; overflow: hidden; margin: 8px 0; }
+.signal-bar div { display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 600; min-width: 30px; }
+.signal-buy { background: #0d4429; color: #3fb950; }
+.signal-hold { background: #2d333b; color: #8b949e; }
+.signal-sell { background: #490b0b; color: #f85149; }
+.signal-short { background: #3b1f0b; color: #d29922; }
+.position-card { border-left: 4px solid #58a6ff; }
+.position-long { border-left-color: #3fb950; }
+.position-short { border-left-color: #f85149; }
+.tag { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 600; }
+.tag-green { background: #0d4429; color: #3fb950; }
+.tag-red { background: #490b0b; color: #f85149; }
+.tag-gray { background: #2d333b; color: #8b949e; }
+.tag-blue { background: #0c2d6b; color: #58a6ff; }
+table { width: 100%; border-collapse: collapse; }
+th, td { padding: 10px 12px; text-align: left; border-bottom: 1px solid #21262d; font-size: 13px; }
+th { color: #8b949e; font-weight: 600; }
+.gauge { width: 100%; height: 8px; background: #21262d; border-radius: 4px; overflow: hidden; margin-top: 4px; }
+.gauge-fill { height: 100%; border-radius: 4px; transition: width 0.5s; }
+.section-title { font-size: 16px; font-weight: 600; color: #f0f6fc; margin: 24px 0 12px; }
+.config-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 8px; }
+.config-item { display: flex; justify-content: space-between; padding: 6px 0; }
+.config-key { color: #8b949e; font-size: 13px; }
+.config-val { color: #58a6ff; font-size: 13px; font-weight: 600; }
+.empty { color: #484f58; text-align: center; padding: 40px; font-size: 14px; }
+#countdown { font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>Alpha Trading Bot</h1>
+  <div>
+    <span id="statusBadge" class="status-badge status-stopped">OFFLINE</span>
+    <span id="modeBadge" class="status-badge tag-gray" style="margin-left:8px"></span>
+  </div>
+</div>
+<div class="container">
+  <!-- Market -->
+  <div class="grid">
+    <div class="card">
+      <div class="card-title">Market</div>
+      <div><span class="price-big" id="price">--</span><span class="price-change" id="change24"></span></div>
+      <div style="margin-top:16px">
+        <div class="metric"><span class="metric-label">24h High</span><span class="metric-value" id="high24">--</span></div>
+        <div class="metric"><span class="metric-label">24h Low</span><span class="metric-value" id="low24">--</span></div>
+        <div class="metric"><span class="metric-label">RSI</span><span class="metric-value" id="rsi">--</span></div>
+        <div class="gauge"><div class="gauge-fill" id="rsiGauge" style="width:50%;background:#8b949e"></div></div>
+        <div class="metric"><span class="metric-label">Trend</span><span class="metric-value" id="trend">--</span></div>
+        <div class="metric"><span class="metric-label">ATR</span><span class="metric-value" id="atr">--</span></div>
+      </div>
+    </div>
+    <div class="card" id="posCard">
+      <div class="card-title">Position</div>
+      <div id="posContent"><div class="empty">No Position</div></div>
+    </div>
+    <div class="card">
+      <div class="card-title">Bot Status</div>
+      <div class="metric"><span class="metric-label">Next Cycle</span><span class="metric-value" id="countdown">--</span></div>
+      <div class="metric"><span class="metric-label">Total Trades</span><span class="metric-value" id="totalTrades">0</span></div>
+      <div class="metric"><span class="metric-label">Daily PnL</span><span class="metric-value" id="dailyPnl">$0.00</span></div>
+      <div class="metric"><span class="metric-label">Uptime</span><span class="metric-value" id="uptime">--</span></div>
+      <div class="metric"><span class="metric-label">Test Mode</span><span class="metric-value" id="testMode">--</span></div>
+    </div>
+  </div>
+
+  <!-- Signals -->
+  <div class="card" style="margin-bottom:16px">
+    <div class="card-title">AI Signal Distribution</div>
+    <div id="signalBars"><div class="empty">No signal data yet</div></div>
+  </div>
+
+  <!-- Trades -->
+  <div class="card" style="margin-bottom:16px">
+    <div class="card-title">Recent Trades</div>
+    <div style="overflow-x:auto">
+      <table>
+        <thead><tr><th>Time</th><th>Type</th><th>Side</th><th>Amount</th><th>Price</th><th>PnL</th><th>Reason</th></tr></thead>
+        <tbody id="tradeBody"><tr><td colspan="7" class="empty">No trades yet</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Config -->
+  <div class="card">
+    <div class="card-title">Configuration</div>
+    <div class="config-grid" id="configGrid"></div>
+  </div>
+</div>
+
+<script>
+const fmt = (n, d=2) => n != null ? Number(n).toLocaleString(undefined, {minimumFractionDigits:d, maximumFractionDigits:d}) : '--';
+const fmtPct = (n) => n != null ? (n >= 0 ? '+' : '') + Number(n).toFixed(2) + '%' : '--';
+
+async function fetchJSON(url) {
+  try { const r = await fetch(url); return r.ok ? await r.json() : null; } catch { return null; }
+}
+
+function formatTime(ts) {
+  if (!ts) return '--';
+  const d = new Date(ts * 1000);
+  return d.toLocaleTimeString('zh-CN', {hour:'2-digit',minute:'2-digit'});
+}
+
+function formatDuration(secs) {
+  if (!secs && secs !== 0) return '--';
+  const h = Math.floor(secs/3600), m = Math.floor((secs%3600)/60);
+  return h > 0 ? `${h}h ${m}m` : `${m}m`;
+}
+
+async function refresh() {
+  // Status
+  const s = await fetchJSON('/api/status');
+  if (s) {
+    const badge = document.getElementById('statusBadge');
+    badge.textContent = s.running ? 'RUNNING' : 'STOPPED';
+    badge.className = 'status-badge ' + (s.running ? 'status-running' : 'status-stopped');
+    document.getElementById('modeBadge').textContent = s.test_mode ? 'TEST' : 'LIVE';
+    document.getElementById('modeBadge').className = 'status-badge ' + (s.test_mode ? 'tag-gray' : 'tag-red');
+    document.getElementById('countdown').textContent = s.next_cycle_seconds != null ? formatDuration(s.next_cycle_seconds) : '--';
+    document.getElementById('totalTrades').textContent = s.total_trades || 0;
+    document.getElementById('dailyPnl').textContent = '$' + fmt(s.daily_pnl);
+    document.getElementById('dailyPnl').className = 'metric-value ' + (s.daily_pnl >= 0 ? 'up' : 'down');
+    document.getElementById('uptime').textContent = formatDuration(s.uptime_seconds);
+    document.getElementById('testMode').textContent = s.test_mode ? 'Yes' : 'No';
+  }
+
+  // Market
+  const m = await fetchJSON('/api/market');
+  if (m && !m.error) {
+    document.getElementById('price').textContent = '$' + fmt(m.price, 1);
+    const ch = document.getElementById('change24');
+    ch.textContent = fmtPct(m.change_percent);
+    ch.className = 'price-change ' + (m.change_percent >= 0 ? 'up' : 'down');
+    document.getElementById('high24').textContent = '$' + fmt(m.high, 1);
+    document.getElementById('low24').textContent = '$' + fmt(m.low, 1);
+    const t = m.technical || {};
+    const rsiVal = t.rsi != null ? Number(t.rsi).toFixed(1) : '--';
+    document.getElementById('rsi').textContent = rsiVal;
+    const rsiG = document.getElementById('rsiGauge');
+    if (t.rsi != null) {
+      const pct = Math.min(100, Math.max(0, t.rsi));
+      rsiG.style.width = pct + '%';
+      rsiG.style.background = t.rsi > 70 ? '#f85149' : t.rsi < 30 ? '#3fb950' : '#d29922';
+    }
+    document.getElementById('trend').textContent = (t.trend_direction || '--') + (t.trend_strength ? ' (' + Number(t.trend_strength).toFixed(1) + ')' : '');
+    document.getElementById('atr').textContent = t.atr ? '$' + fmt(t.atr, 0) : '--';
+  }
+
+  // Position
+  const p = await fetchJSON('/api/position');
+  const posCard = document.getElementById('posCard');
+  const posC = document.getElementById('posContent');
+  if (p && p.has_position && p.context) {
+    const c = p.context;
+    const cls = c.side === 'long' ? 'position-long' : 'position-short';
+    posCard.className = 'card position-card ' + cls;
+    const pnlColor = (c.unrealized_pnl || 0) >= 0 ? 'up' : 'down';
+    posC.innerHTML = `
+      <div style="margin-bottom:12px">
+        <span class="tag ${c.side==='long'?'tag-green':'tag-red'}">${(c.side||'').toUpperCase()}</span>
+        <span class="tag tag-blue" style="margin-left:4px">${c.symbol||''}</span>
+        <span class="tag tag-gray" style="margin-left:4px">${c.health||''}</span>
+      </div>
+      <div class="metric"><span class="metric-label">Amount</span><span class="metric-value">${fmt(c.amount,4)}</span></div>
+      <div class="metric"><span class="metric-label">Entry Price</span><span class="metric-value">$${fmt(c.entry_price,1)}</span></div>
+      <div class="metric"><span class="metric-label">Unrealized PnL</span><span class="metric-value ${pnlColor}">$${fmt(c.unrealized_pnl)}</span></div>
+      <div class="metric"><span class="metric-label">PnL %</span><span class="metric-value ${pnlColor}">${fmtPct(c.pnl_percent)}</span></div>
+      <div class="metric"><span class="metric-label">Duration</span><span class="metric-value">${formatDuration((c.duration_hours||0)*3600)}</span></div>
+    `;
+  } else {
+    posCard.className = 'card';
+    posC.innerHTML = '<div class="empty">No Position</div>';
+  }
+
+  // Signals
+  const sig = await fetchJSON('/api/signals');
+  if (sig && sig.distribution) {
+    const container = document.getElementById('signalBars');
+    container.innerHTML = '';
+    for (const [src, counts] of Object.entries(sig.distribution)) {
+      const total = counts.total || 1;
+      const b = Math.round((counts.buy||0)/total*100);
+      const h = Math.round((counts.hold||0)/total*100);
+      const s = Math.round((counts.sell||0)/total*100);
+      const sh = Math.round((counts.short||0)/total*100);
+      container.innerHTML += `
+        <div style="margin-bottom:8px">
+          <div style="display:flex;justify-content:space-between;margin-bottom:4px">
+            <span style="font-size:13px;color:#8b949e">${src}</span>
+            <span style="font-size:12px;color:#484f58">${total} signals</span>
+          </div>
+          <div class="signal-bar">
+            ${b ? `<div class="signal-buy" style="width:${b}%">${b>8?'BUY '+b+'%':''}</div>` : ''}
+            ${h ? `<div class="signal-hold" style="width:${h}%">${h>8?'HOLD '+h+'%':''}</div>` : ''}
+            ${s ? `<div class="signal-sell" style="width:${s}%">${s>8?'SELL '+s+'%':''}</div>` : ''}
+            ${sh ? `<div class="signal-short" style="width:${sh}%">${sh>8?'SHORT '+sh+'%':''}</div>` : ''}
+          </div>
+        </div>`;
+    }
+    if (!Object.keys(sig.distribution).length) {
+      container.innerHTML = '<div class="empty">No signal data yet</div>';
+    }
+  }
+
+  // Trades
+  const tr = await fetchJSON('/api/trades?limit=20');
+  if (tr && tr.trades && tr.trades.length) {
+    const tbody = document.getElementById('tradeBody');
+    tbody.innerHTML = '';
+    for (const t of tr.trades.slice().reverse()) {
+      const typeTag = t.type === 'open' ? '<span class="tag tag-green">OPEN</span>' : '<span class="tag tag-red">CLOSE</span>';
+      const sideTag = t.side === 'long' ? '<span class="tag tag-green">LONG</span>' : '<span class="tag tag-red">SHORT</span>';
+      const pnlClass = (t.pnl || 0) >= 0 ? 'up' : 'down';
+      tbody.innerHTML += `<tr>
+        <td>${formatTime(Date.parse(t.timestamp)/1000 || 0)}</td>
+        <td>${typeTag}</td><td>${sideTag}</td>
+        <td>${fmt(t.amount,4)}</td><td>$${fmt(t.price,1)}</td>
+        <td class="${pnlClass}">$${fmt(t.pnl)}</td><td style="color:#8b949e">${t.reason||''}</td>
+      </tr>`;
+    }
+  }
+
+  // Config
+  const cfg = await fetchJSON('/api/config');
+  if (cfg && !cfg.error) {
+    const grid = document.getElementById('configGrid');
+    const items = [
+      ['AI Mode', cfg.ai_mode], ['AI Provider', cfg.ai_provider],
+      ['Investment Type', cfg.investment_type], ['Leverage', s ? s.leverage+'x' : '--'],
+      ['Stop Loss', cfg.stop_loss_percent ? (cfg.stop_loss_percent*100).toFixed(1)+'%' : '--'],
+      ['Take Profit', cfg.take_profit_percent ? (cfg.take_profit_percent*100).toFixed(1)+'%' : '--'],
+      ['Cycle', cfg.cycle_minutes+'min'], ['Smart TP/SL', cfg.smart_tp_sl?'On':'Off'],
+      ['Trailing Stop', cfg.trailing_stop?'On':'Off'],
+    ];
+    grid.innerHTML = items.map(([k,v]) =>
+      `<div class="config-item"><span class="config-key">${k}</span><span class="config-val">${v||'--'}</span></div>`
+    ).join('');
+  }
+}
+
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>

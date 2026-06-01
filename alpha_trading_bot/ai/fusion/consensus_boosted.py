@@ -1,0 +1,803 @@
+"""
+一致性强化融合策略
+
+功能：
+- 支持多种融合策略（加权平均/多数表决/共识/置信度优先）
+- 新增一致性强化机制
+- 当多个AI一致时强化信号
+- 支持动态阈值调整
+
+作者：AI Trading System
+日期：2026-02-04
+"""
+
+import logging
+from typing import Dict, List, Optional, Any
+from dataclasses import dataclass
+from enum import Enum
+
+from .base import FusionStrategy
+
+logger = logging.getLogger(__name__)
+
+
+class FusionStrategyType(Enum):
+    """融合策略类型"""
+
+    WEIGHTED = "weighted"  # 加权平均
+    MAJORITY = "majority"  # 多数表决
+    CONSENSUS = "consensus"  # 共识（需全一致）
+    CONFIDENCE = "confidence"  # 置信度优先
+    CONSENSUS_BOOSTED = "consensus_boosted"  # 一致性强化（推荐）
+
+
+@dataclass
+class FusionConfig:
+    """融合配置"""
+
+    strategy: FusionStrategyType = FusionStrategyType.CONSENSUS_BOOSTED
+    threshold: float = 0.30
+    consensus_boost_full: float = 1.25
+    consensus_boost_partial: float = 1.2
+    default_confidence: float = 0.7
+    partial_consensus_threshold: float = 0.4
+    kimi_buy_rebound_boost: float = 1.3
+    rsi_rebound_low: float = 28
+    rsi_rebound_high: float = 75
+    rsi_high_suppression: float = 78
+    enable_rebound_mode: bool = True
+    buy_bias: float = 1.0  # 1.15→1.0，移除买入偏置，保持信号平衡
+    sell_bias: float = 1.15  # 新增卖出偏置，当RSI>70时启用
+    short_bias: float = 1.2  # 新增做空偏置，趋势向下时启用
+
+
+@dataclass
+class FusionResult:
+    """融合结果"""
+
+    signal: str  # buy | hold | sell
+    confidence: float  # 0-1
+    scores: Dict[str, float]  # 各信号得分
+    threshold: float
+    is_valid: bool
+    consensus_ratio: float  # 一致性比例
+    strategy_used: str
+    details: Dict[str, Any]
+
+
+class ConsensusBoostedFusion(FusionStrategy):
+    """
+    一致性强化融合策略
+
+    核心思想：
+    1. 当多个AI给出相同信号时，该信号的可信度更高
+    2. 全部一致时强化1.3倍
+    3. 2/3以上一致时强化1.15倍
+    4. 分歧时使用加权平均
+
+    支持的策略：
+    - weighted: 加权平均（置信度加权）
+    - majority: 多数表决
+    - consensus: 共识（需所有AI一致）
+    - confidence: 置信度优先
+    - consensus_boosted: 一致性强化（推荐）
+    """
+
+    def __init__(self, config: Optional[FusionConfig] = None):
+        """
+        初始化融合策略
+
+        Args:
+            config: 融合配置，如果为None则使用默认配置
+        """
+        self.config = config or FusionConfig()
+        self._validate_config()
+
+        logger.info(
+            f"[一致性强化融合] 初始化完成: "
+            f"策略={self.config.strategy.value}, "
+            f"阈值={self.config.threshold}, "
+            f"全一致强化={self.config.consensus_boost_full}x, "
+            f"部分一致强化={self.config.consensus_boost_partial}x"
+        )
+
+    def fuse(
+        self,
+        signals: List[Dict[str, str]],
+        weights: Dict[str, float],
+        threshold: float = 0.5,
+        *,
+        confidences: Optional[Dict[str, float]] = None,
+        market_data: Optional[Dict[str, Any]] = None,
+    ) -> FusionResult:
+        """
+        融合多个AI信号
+
+        Args:
+            signals: [{"provider": "deepseek", "signal": "buy"}, ...]
+            weights: {"deepseek": 0.5, "kimi": 0.5, ...}
+            threshold: 融合阈值（可选，覆盖配置）
+            confidences: {"deepseek": 0.7, "kimi": 0.75, ...} 置信度（可选）
+
+        Returns:
+            FusionResult: 融合结果
+        """
+        if not signals:
+            logger.warning("[融合] 无有效信号，返回hold")
+            return FusionResult(
+                signal="hold",
+                confidence=0.6,
+                scores={"buy": 0, "hold": 1, "sell": 0, "short": 0},
+                threshold=threshold or self.config.threshold,
+                is_valid=False,
+                consensus_ratio=0.0,
+                strategy_used=self.config.strategy.value,
+                details={"reason": "no signals", "market_data": market_data or {}},
+            )
+
+        # 计算一致性比例
+        signal_counts = self._count_signals(signals)
+        total = len(signals)
+        max_count = max(signal_counts.values())
+        consensus_ratio = max_count / total
+
+        # 根据策略进行融合
+        if self.config.strategy == FusionStrategyType.WEIGHTED:
+            return self._fuse_weighted(
+                signals, weights, threshold, confidences, consensus_ratio
+            )
+        elif self.config.strategy == FusionStrategyType.MAJORITY:
+            return self._fuse_majority(signals, threshold, consensus_ratio)
+        elif self.config.strategy == FusionStrategyType.CONSENSUS:
+            return self._fuse_consensus(signals, threshold, consensus_ratio)
+        elif self.config.strategy == FusionStrategyType.CONFIDENCE:
+            return self._fuse_confidence(signals, threshold, consensus_ratio)
+        else:
+            # 修复 BUG：始终计算动态阈值，不依赖 threshold 是否为 None
+            # 根据市场环境动态调整信号触发条件
+
+            # 先计算原始得分，确定可能胜出的信号类型
+            raw_scores: Dict[str, float] = {
+                "buy": 0.0,
+                "hold": 0.0,
+                "sell": 0.0,
+                "short": 0.0,
+            }
+            for s in signals:
+                sig = s["signal"]
+                weight = weights.get(s["provider"], 1.0)
+                confidence = (
+                    confidences.get(s["provider"], self.config.default_confidence)
+                    if confidences
+                    else self.config.default_confidence
+                )
+                raw_scores[sig] += weight * confidence
+
+            # 确定可能胜出的信号类型
+            likely_winner = max(raw_scores, key=lambda signal: raw_scores[signal])
+
+            # 根据可能的胜出信号类型计算动态阈值
+            signal_type = (
+                likely_winner if likely_winner in ["buy", "sell"] else "general"
+            )
+            effective_threshold = self._calculate_dynamic_threshold(
+                market_data, signal_type
+            )
+
+            return self._fuse_consensus_boosted(
+                signals,
+                weights,
+                effective_threshold,
+                confidences,
+                consensus_ratio,
+                market_data,
+            )
+
+    def _count_signals(self, signals: List[Dict[str, str]]) -> Dict[str, int]:
+        """统计各信号数量"""
+        counts = {"buy": 0, "hold": 0, "sell": 0, "short": 0}
+        for s in signals:
+            sig = s["signal"]
+            if sig in counts:
+                counts[sig] += 1
+        return counts
+
+    def _fuse_weighted(
+        self,
+        signals: List[Dict[str, str]],
+        weights: Dict[str, float],
+        threshold: Optional[float],
+        confidences: Optional[Dict[str, float]],
+        consensus_ratio: float,
+    ) -> FusionResult:
+        """加权平均融合"""
+        threshold = threshold or self.config.threshold
+
+        weighted_scores: Dict[str, float] = {
+            "buy": 0.0,
+            "hold": 0.0,
+            "sell": 0.0,
+            "short": 0.0,
+        }
+        total_weight = 0
+
+        for s in signals:
+            provider = s["provider"]
+            sig = s["signal"]
+            weight = weights.get(provider, 1.0)
+            confidence = self.config.default_confidence
+            if confidences:
+                confidence = confidences.get(provider, self.config.default_confidence)
+
+            adjusted_weight = weight * max(0.0, min(1.0, confidence))
+            weighted_scores[sig] += adjusted_weight
+            total_weight += adjusted_weight
+
+        # 归一化
+        if total_weight > 0:
+            for sig in weighted_scores:
+                weighted_scores[sig] /= total_weight
+
+        max_sig = max(weighted_scores, key=lambda signal: weighted_scores[signal])
+        max_score = weighted_scores[max_sig]
+        is_valid = max_score >= threshold
+
+        logger.info(
+            f"[融合-加权平均] 结果: {max_sig} (buy:{weighted_scores['buy']:.2f}, "
+            f"hold:{weighted_scores['hold']:.2f}, sell:{weighted_scores['sell']:.2f}, "
+            f"阈值:{threshold}, 有效:{is_valid})"
+        )
+
+        return FusionResult(
+            signal=max_sig,
+            confidence=max_score,
+            scores=weighted_scores,
+            threshold=threshold,
+            is_valid=is_valid,
+            consensus_ratio=consensus_ratio,
+            strategy_used="weighted",
+            details={"type": "weighted", "market_data": {}},
+        )
+
+    def _fuse_majority(
+        self,
+        signals: List[Dict[str, str]],
+        threshold: Optional[float],
+        consensus_ratio: float,
+    ) -> FusionResult:
+        """多数表决融合"""
+        threshold = threshold or self.config.threshold
+
+        signal_counts = self._count_signals(signals)
+        total = len(signals)
+
+        for sig, count in signal_counts.items():
+            if count / total >= threshold:
+                logger.info(
+                    f"[融合-多数表决] 结果: {sig} ({count}/{total} >= {threshold})"
+                )
+                return FusionResult(
+                    signal=sig,
+                    confidence=count / total,
+                    scores={k: v / total for k, v in signal_counts.items()},
+                    threshold=threshold,
+                    is_valid=True,
+                    consensus_ratio=consensus_ratio,
+                    strategy_used="majority",
+                    details={"count": count, "total": total, "market_data": {}},
+                )
+
+        # 未达阈值，取最多的
+        max_sig = max(signal_counts, key=lambda signal: signal_counts[signal])
+        logger.info(f"[融合-多数表决-降级] 结果: {max_sig} (max count)")
+
+        return FusionResult(
+            signal=max_sig,
+            confidence=signal_counts[max_sig] / total,
+            scores={k: v / total for k, v in signal_counts.items()},
+            threshold=threshold,
+            is_valid=False,
+            consensus_ratio=consensus_ratio,
+            strategy_used="majority",
+            details={
+                "count": signal_counts[max_sig],
+                "total": total,
+                "fallback": True,
+                "market_data": {},
+            },
+        )
+
+    def _fuse_consensus(
+        self,
+        signals: List[Dict[str, str]],
+        threshold: Optional[float],
+        consensus_ratio: float,
+    ) -> FusionResult:
+        """共识融合（需所有AI一致）"""
+        threshold = threshold or self.config.threshold
+
+        unique_signals = set(s["signal"] for s in signals)
+        if len(unique_signals) == 1:
+            sig = list(unique_signals)[0]
+            logger.info(f"[融合-共识] 结果: {sig} (all agreed)")
+
+            if sig == "hold":
+                confidence = min(0.6 * consensus_ratio, 0.7)
+            else:
+                confidence = 1.0
+
+            return FusionResult(
+                signal=sig,
+                confidence=confidence,
+                scores={
+                    "buy": 1.0 if sig == "buy" else 0,
+                    "hold": 1.0 if sig == "hold" else 0,
+                    "sell": 1.0 if sig == "sell" else 0,
+                    "short": 1.0 if sig == "short" else 0,
+                },
+                threshold=threshold,
+                is_valid=True,
+                consensus_ratio=consensus_ratio,
+                strategy_used="consensus",
+                details={"reason": "all agreed", "market_data": {}},
+            )
+        else:
+            logger.warning(f"[融合-共识] 未达成共识: {unique_signals}，默认hold")
+            return FusionResult(
+                signal="hold",
+                confidence=0.6,
+                scores={"buy": 0, "hold": 1, "sell": 0, "short": 0},
+                threshold=threshold,
+                is_valid=False,
+                consensus_ratio=consensus_ratio,
+                strategy_used="consensus",
+                details={
+                    "reason": "no consensus",
+                    "signals": list(unique_signals),
+                    "market_data": {},
+                },
+            )
+
+    def _fuse_confidence(
+        self,
+        signals: List[Dict[str, str]],
+        threshold: Optional[float],
+        consensus_ratio: float,
+    ) -> FusionResult:
+        """置信度优先融合"""
+        threshold = threshold or self.config.threshold
+
+        signal_counts = {"buy": 0, "hold": 0, "sell": 0, "short": 0}
+        for s in signals:
+            if s["signal"] in signal_counts:
+                signal_counts[s["signal"]] += 1
+
+        buy_count = signal_counts["buy"]
+        sell_count = signal_counts["sell"]
+        total = len(signals)
+
+        if buy_count > sell_count and buy_count / total >= threshold:
+            logger.info(f"[融合-置信度] 结果: buy ({buy_count}/{total})")
+            return FusionResult(
+                signal="buy",
+                confidence=buy_count / total,
+                scores={k: v / total for k, v in signal_counts.items()},
+                threshold=threshold,
+                is_valid=True,
+                consensus_ratio=consensus_ratio,
+                strategy_used="confidence",
+                details={"count": buy_count, "total": total, "market_data": {}},
+            )
+        elif sell_count > buy_count and sell_count / total >= threshold:
+            logger.info(f"[融合-置信度] 结果: sell ({sell_count}/{total})")
+            return FusionResult(
+                signal="sell",
+                confidence=sell_count / total,
+                scores={k: v / total for k, v in signal_counts.items()},
+                threshold=threshold,
+                is_valid=True,
+                consensus_ratio=consensus_ratio,
+                strategy_used="confidence",
+                details={"count": sell_count, "total": total, "market_data": {}},
+            )
+
+        logger.info("[融合-置信度] 结果: hold (no majority)")
+        return FusionResult(
+            signal="hold",
+            confidence=0.6,
+            scores={k: v / total for k, v in signal_counts.items()},
+            threshold=threshold,
+            is_valid=False,
+            consensus_ratio=consensus_ratio,
+            strategy_used="confidence",
+            details={"reason": "no majority", "market_data": {}},
+        )
+
+    def _fuse_consensus_boosted(
+        self,
+        signals: List[Dict[str, str]],
+        weights: Dict[str, float],
+        threshold: Optional[float],
+        confidences: Optional[Dict[str, float]],
+        consensus_ratio: float,
+        market_data: Optional[Dict[str, Any]] = None,
+    ) -> FusionResult:
+        """
+        一致性强化融合（推荐策略）+ 反弹检测增强
+
+        核心逻辑：
+        1. 计算加权得分
+        2. 根据一致性比例强化得分
+        3. 全部一致时强化1.3倍
+        4. 2/3以上一致时强化1.15倍
+        5. 反弹区间Kimi BUY加权，高位抑制
+        """
+        threshold = threshold or self.config.threshold
+
+        # 提取RSI和趋势方向
+        rsi = 50  # 默认中性
+        trend_direction = "neutral"
+        if market_data:
+            technical = market_data.get("technical", {})
+            rsi = technical.get("rsi", 50)
+            trend_direction = technical.get("trend_direction", "neutral")
+
+        # 记录反弹检测信息
+        if self.config.enable_rebound_mode:
+            logger.info(
+                f"[融合-反弹+高位] 反弹检测: RSI={rsi:.1f}, 趋势={trend_direction}, "
+                f"反弹区间=[{self.config.rsi_rebound_low}-{self.config.rsi_rebound_high}], "
+                f"高位抑制=[>{self.config.rsi_high_suppression}]"
+            )
+
+        # 步骤1: 计算加权得分
+        weighted_scores: Dict[str, float] = {
+            "buy": 0.0,
+            "hold": 0.0,
+            "sell": 0.0,
+            "short": 0.0,
+        }
+        total_weight = 0
+
+        # 检查是否有Kimi BUY信号
+        has_kimi_buy = any(
+            s["provider"] == "kimi" and s["signal"] == "buy" for s in signals
+        )
+
+        for s in signals:
+            provider = s["provider"]
+            sig = s["signal"]
+            weight = weights.get(provider, 1.0)
+            confidence = self.config.default_confidence
+            if confidences:
+                confidence = confidences.get(provider, self.config.default_confidence)
+
+            confidence = max(0.0, min(1.0, confidence))
+            adjusted_weight = weight * confidence
+
+            # Kimi BUY在反弹区间加权
+            if (
+                self.config.enable_rebound_mode
+                and sig == "buy"
+                and provider == "kimi"
+                and self.config.rsi_rebound_low <= rsi <= self.config.rsi_rebound_high
+                and trend_direction != "bearish"
+            ):
+                adjusted_weight *= self.config.kimi_buy_rebound_boost
+                logger.info(
+                    f"[融合] Kimi BUY反弹加权: 置信度={confidence}%, "
+                    f"RSI={rsi:.1f}, 加权后={adjusted_weight:.3f}"
+                )
+
+            weighted_scores[sig] += adjusted_weight
+            total_weight += adjusted_weight
+
+        boost_factor = 1.0
+        boost_reason = ""
+
+        max_sig = max(weighted_scores, key=lambda signal: weighted_scores[signal])
+
+        if consensus_ratio >= 1.0:
+            boost_factor = self.config.consensus_boost_full
+            boost_reason = f"全部一致({max_sig})，强化{boost_factor}x"
+        elif consensus_ratio >= self.config.partial_consensus_threshold:
+            boost_factor = self.config.consensus_boost_partial
+            boost_reason = f"部分一致({consensus_ratio:.0%})，强化{boost_factor}x"
+        elif (
+            self.config.enable_rebound_mode
+            and has_kimi_buy
+            and self.config.rsi_rebound_low <= rsi <= self.config.rsi_rebound_high
+        ):
+            boost_factor = 1.1
+            boost_reason = f"Kimi反弹区间，强化{boost_factor}x"
+
+        # 高位抑制BUY（RSI > 60 时）
+        if (
+            self.config.enable_rebound_mode
+            and max_sig == "buy"
+            and rsi > self.config.rsi_high_suppression
+        ):
+            weighted_scores["buy"] *= 0.5
+            logger.info(
+                f"[融合] 高位抑制BUY: RSI={rsi:.1f} > {self.config.rsi_high_suppression}, "
+                f"得分减半"
+            )
+            # 重新确定胜出信号
+            max_sig = max(weighted_scores, key=lambda signal: weighted_scores[signal])
+
+        weighted_scores[max_sig] *= boost_factor
+
+        # 步骤3: 归一化
+        total = sum(weighted_scores.values())
+        if total > 0:
+            for sig in weighted_scores:
+                weighted_scores[sig] /= total
+
+        # 步骤4: 买入偏好 - 当buy与hold得分接近时，倾向买入
+        if self.config.buy_bias > 1.0:
+            buy_score = weighted_scores.get("buy", 0)
+            hold_score = weighted_scores.get("hold", 0)
+            # 如果buy得分在hold的85%以内，给buy一个偏好加成
+            if hold_score > 0 and buy_score >= hold_score * 0.85:
+                weighted_scores["buy"] *= self.config.buy_bias
+                logger.info(
+                    f"[融合] 买入偏好触发: buy={buy_score:.3f}, hold={hold_score:.3f}, "
+                    f"偏好系数={self.config.buy_bias}x"
+                )
+                # 重新归一化
+                total = sum(weighted_scores.values())
+                if total > 0:
+                    for sig in weighted_scores:
+                        weighted_scores[sig] /= total
+
+        # 步骤4.1: 卖出偏好 - 当RSI超买时，倾向SELL
+        if self.config.sell_bias > 1.0 and rsi > 70:
+            sell_score = weighted_scores.get("sell", 0)
+            hold_score = weighted_scores.get("hold", 0)
+            # 如果sell得分不为0，给予卖出偏好
+            if sell_score > 0:
+                weighted_scores["sell"] *= self.config.sell_bias
+                logger.info(
+                    f"[融合] 卖出偏好触发(RSI超买): RSI={rsi:.1f}, sell={sell_score:.3f}, "
+                    f"偏好系数={self.config.sell_bias}x"
+                )
+                # 重新归一化
+                total = sum(weighted_scores.values())
+                if total > 0:
+                    for sig in weighted_scores:
+                        weighted_scores[sig] /= total
+
+        # 步骤4.2: 做空偏好 - 当趋势向下时，倾向SHORT
+        if self.config.short_bias > 1.0 and market_data:
+            technical = market_data.get("technical", {})
+            trend_direction = technical.get("trend_direction", "neutral")
+            if trend_direction == "down":
+                short_score = weighted_scores.get("short", 0)
+                if short_score > 0:
+                    weighted_scores["short"] *= self.config.short_bias
+                    logger.info(
+                        f"[融合] 做空偏好触发(趋势向下): short={short_score:.3f}, "
+                        f"偏好系数={self.config.short_bias}x"
+                    )
+                    total = sum(weighted_scores.values())
+                    if total > 0:
+                        for sig in weighted_scores:
+                            weighted_scores[sig] /= total
+
+        if self.config.buy_bias > 1.0:
+            buy_score = weighted_scores.get("buy", 0)
+            hold_score = weighted_scores.get("hold", 0)
+            if hold_score > 0 and buy_score >= hold_score * 0.85:
+                weighted_scores["buy"] *= self.config.buy_bias
+                logger.info(
+                    f"[融合] 买入偏好触发: buy={buy_score:.3f}, hold={hold_score:.3f}, "
+                    f"偏好系数={self.config.buy_bias}x"
+                )
+                total = sum(weighted_scores.values())
+                if total > 0:
+                    for sig in weighted_scores:
+                        weighted_scores[sig] /= total
+
+        # 步骤5: 最终判断
+        max_sig = max(weighted_scores, key=lambda signal: weighted_scores[signal])
+        max_score = weighted_scores[max_sig]
+        is_valid = max_score >= threshold
+
+        # HOLD 信号不应给太高置信度，基于一致性比例调整
+        final_confidence = max_score
+        if max_sig == "hold":
+            final_confidence = min(0.7, max_score * consensus_ratio * 1.2)
+
+        logger.info(
+            f"[融合-一致性强化] 结果: {max_sig} "
+            f"(buy:{weighted_scores['buy']:.2f}, hold:{weighted_scores['hold']:.2f}, "
+            f"sell:{weighted_scores['sell']:.2f}, 阈值:{threshold}, "
+            f"有效:{is_valid}, 一致性:{consensus_ratio:.0%}, {boost_reason})"
+        )
+
+        return FusionResult(
+            signal=max_sig,
+            confidence=final_confidence,
+            scores=weighted_scores,
+            threshold=threshold,
+            is_valid=is_valid,
+            consensus_ratio=consensus_ratio,
+            strategy_used="consensus_boosted",
+            details={
+                "type": "consensus_boosted",
+                "boost_factor": boost_factor,
+                "boost_reason": boost_reason,
+                "scheme_d_enabled": self.config.enable_rebound_mode,
+                "rsi": rsi,
+                "trend_direction": trend_direction,
+                "original_scores": {
+                    k: v / boost_factor if k == max_sig and boost_factor > 1 else v
+                    for k, v in weighted_scores.items()
+                },
+            },
+        )
+
+    def _calculate_dynamic_threshold(
+        self,
+        market_data: Optional[Dict[str, Any]],
+        signal_type: str = "general",
+    ) -> float:
+        """
+        动态阈值计算
+
+        根据市场环境和信号类型动态调整融合阈值：
+        - RSI超卖区域：降低买入阈值，更容易触发买入
+        - RSI超买区域：降低卖出阈值，更容易获利了结
+        - 高波动环境 + 上升趋势：降低买入阈值（顺势做多）
+        - 高波动环境 + 下降趋势：提高买入阈值（避免抄底）
+        - 强趋势环境：根据趋势方向调整
+
+        Args:
+            market_data: 市场数据字典
+            signal_type: 信号类型 ("buy"/"sell"/"general")
+
+        Returns:
+            float: 动态调整后的阈值
+        """
+        if not market_data:
+            return self.config.threshold
+
+        base_threshold = self.config.threshold
+        technical = market_data.get("technical", {})
+        rsi = technical.get("rsi", 50)
+        atr_pct = technical.get("atr_percent", 0)
+        trend_strength = technical.get("trend_strength", 0)
+        trend_direction = technical.get("trend_direction", "neutral")
+
+        # 记录趋势方向信息
+        logger.info(
+            f"[融合-动态阈值] 趋势方向={trend_direction}, 强度={trend_strength:.2f}, "
+            f"信号类型={signal_type}, RSI={rsi:.1f}, ATR={atr_pct:.1%}"
+        )
+
+        # RSI超卖区域（<35）：降低买入阈值，更容易抄底
+        if rsi < 35:
+            dynamic_threshold = max(0.30, base_threshold - 0.10)
+            logger.info(
+                f"[融合-动态阈值] RSI超卖({rsi:.1f})，阈值调整: {base_threshold:.2f} -> {dynamic_threshold:.2f}"
+            )
+            return dynamic_threshold
+
+        # RSI超买区域（>65）：降低卖出阈值，更容易获利了结
+        elif rsi > 65:
+            dynamic_threshold = max(0.30, base_threshold - 0.08)
+            logger.info(
+                f"[融合-动态阈值] RSI超买({rsi:.1f})，阈值调整: {base_threshold:.2f} -> {dynamic_threshold:.2f}"
+            )
+            return dynamic_threshold
+
+        # 高波动环境（ATR > 3%）：根据趋势方向调整
+        elif atr_pct > 0.03:
+            if trend_direction == "bullish":
+                # 上升趋势中：降低买入阈值，顺势做多
+                dynamic_threshold = max(0.35, base_threshold - 0.08)
+                logger.info(
+                    f"[融合-动态阈值] 高波动+上升趋势，{signal_type}阈值调整: "
+                    f"{base_threshold:.2f} -> {dynamic_threshold:.2f} (顺势做多)"
+                )
+            elif trend_direction == "bearish":
+                # 下降趋势中：提高买入阈值，避免逆势抄底
+                dynamic_threshold = min(0.55, base_threshold + 0.08)
+                logger.info(
+                    f"[融合-动态阈值] 高波动+下降趋势，{signal_type}阈值调整: "
+                    f"{base_threshold:.2f} -> {dynamic_threshold:.2f} (避免抄底)"
+                )
+            else:
+                # 震荡市：保持基准
+                dynamic_threshold = base_threshold
+                logger.info(
+                    f"[融合-动态阈值] 高波动+震荡市，{signal_type}阈值保持: {base_threshold:.2f}"
+                )
+            return dynamic_threshold
+
+        # 强趋势环境：根据趋势方向调整
+        elif trend_strength > 0.4:
+            if trend_direction == "bullish":
+                # 上升趋势：buy 略微放宽，sell 略微收紧
+                if signal_type == "buy":
+                    dynamic_threshold = max(0.40, base_threshold - 0.05)
+                    logger.info(
+                        f"[融合-动态阈值] 强上升趋势，buy阈值调整: "
+                        f"{base_threshold:.2f} -> {dynamic_threshold:.2f} (顺势做多)"
+                    )
+                elif signal_type == "sell":
+                    dynamic_threshold = min(0.55, base_threshold + 0.05)
+                    logger.info(
+                        f"[融合-动态阈值] 强上升趋势，sell阈值调整: "
+                        f"{base_threshold:.2f} -> {dynamic_threshold:.2f} (谨慎做空)"
+                    )
+                else:
+                    dynamic_threshold = base_threshold
+            elif trend_direction == "bearish":
+                # 下降趋势：buy 收紧，sell 放宽
+                if signal_type == "buy":
+                    dynamic_threshold = min(0.55, base_threshold + 0.05)
+                    logger.info(
+                        f"[融合-动态阈值] 强下降趋势，buy阈值调整: "
+                        f"{base_threshold:.2f} -> {dynamic_threshold:.2f} (避免抄底)"
+                    )
+                elif signal_type == "sell":
+                    dynamic_threshold = max(0.40, base_threshold - 0.05)
+                    logger.info(
+                        f"[融合-动态阈值] 强下降趋势，sell阈值调整: "
+                        f"{base_threshold:.2f} -> {dynamic_threshold:.2f} (顺势做空)"
+                    )
+                else:
+                    dynamic_threshold = base_threshold
+            else:
+                dynamic_threshold = base_threshold
+            return dynamic_threshold
+
+        # 默认阈值
+        return base_threshold
+
+    def _validate_config(self) -> None:
+        """验证配置合理性"""
+        if self.config.threshold < 0 or self.config.threshold > 1:
+            logger.warning(
+                f"[融合] 警告: threshold({self.config.threshold})应在0-1之间"
+            )
+        if self.config.consensus_boost_full < 1:
+            logger.warning(
+                f"[融合] 警告: consensus_boost_full({self.config.consensus_boost_full})应>=1"
+            )
+        if self.config.consensus_boost_partial < 1:
+            logger.warning(
+                f"[融合] 警告: consensus_boost_partial({self.config.consensus_boost_partial})应>=1"
+            )
+
+    def get_strategy(self, name: str) -> "ConsensusBoostedFusion":
+        """获取指定策略的融合器"""
+        strategy_map = {
+            "weighted": FusionStrategyType.WEIGHTED,
+            "majority": FusionStrategyType.MAJORITY,
+            "consensus": FusionStrategyType.CONSENSUS,
+            "confidence": FusionStrategyType.CONFIDENCE,
+            "consensus_boosted": FusionStrategyType.CONSENSUS_BOOSTED,
+        }
+
+        strategy_type = strategy_map.get(name, FusionStrategyType.CONSENSUS_BOOSTED)
+        self.config.strategy = strategy_type
+        return self
+
+
+def get_fusion_strategy(
+    name: str, config: Optional[FusionConfig] = None
+) -> ConsensusBoostedFusion:
+    """
+    获取融合策略实例
+
+    Args:
+        name: 策略名称
+        config: 配置
+
+    Returns:
+        ConsensusBoostedFusion: 融合策略实例
+    """
+    fusion = ConsensusBoostedFusion(config)
+    return fusion.get_strategy(name)
